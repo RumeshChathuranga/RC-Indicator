@@ -1,0 +1,801 @@
+//@version=6
+indicator("Enhanced FVG Indicator", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+// =================== User Inputs ===================
+// Core Settings
+timeframeInput = input.string("15", "Chart Timeframe", options=["1", "5", "15", "60", "240", "D"])
+detectBISI = input.bool(true, "Detect Bullish FVGs (BISI)")
+detectSIBI = input.bool(true, "Detect Bearish FVGs (SIBI)")
+
+// FVG Configuration
+fvgMinGapSize = input.float(0.05, "Base Minimum Gap Size (%)", minval=0.01, step=0.01)
+useAdaptiveGapSize = input.bool(true, "Use Volatility-Adjusted Gap Size")
+volPeriod = input.int(20, "Volatility Lookback Period", minval=5, maxval=100)
+volMultiplier = input.float(1.5, "Volatility Multiplier", minval=0.5, maxval=5, step=0.1)
+fvgMaxAge = input.int(50, "Maximum FVG Age (bars)", minval=1)
+
+// Display Settings
+showMitigated = input.bool(false, "Show Mitigated FVGs")
+extendFVG = input.bool(true, "Extend FVG Zones")
+labelSize = input.string("small", "Label Size", options=["tiny", "small", "normal", "large"])
+
+// Multi-Timeframe Analysis
+mtfAnalysis = input.bool(true, "Multi-Timeframe Analysis")
+higherTF = input.string("60", "Higher Timeframe", options=["60", "240", "D", "W"])
+lowerTF = input.string("5", "Lower Timeframe", options=["1", "5"])
+
+// Entry Strategy
+showEntrySignals = input.bool(true, "Show Entry Signals")
+entryStrategy = input.string("Advanced", "Entry Strategy", options=["Simple", "Confluence", "Advanced"])
+confluenceRequired = input.int(2, "Required Confluence Count", minval=1, maxval=5)
+
+// Risk Management
+riskManagement = input.bool(true, "Show Risk Management Levels")
+riskRewardRatio = input.float(2.0, "Risk-Reward Ratio", minval=0.5, maxval=5, step=0.1)
+atrPeriod = input.int(14, "ATR Period for Stop Loss", minval=5, maxval=50)
+atrMultiplier = input.float(1.5, "ATR Multiplier for Stop Loss", minval=0.5, maxval=5, step=0.1)
+
+// Order Block Settings
+showOrderBlocks = input.bool(true, "Show Order Blocks")
+obLookback = input.int(10, "Order Block Lookback", minval=5, maxval=50)
+
+// Alerts
+alertsOn = input.bool(true, "Enable Alerts")
+
+// =================== Color Scheme ===================
+bullishFVGColor = input.color(color.new(color.green, 80), "Bullish FVG Fill")
+bearishFVGColor = input.color(color.new(color.red, 80), "Bearish FVG Fill")
+bullishFVGBorderColor = input.color(color.new(color.green, 20), "Bullish FVG Border")
+bearishFVGBorderColor = input.color(color.new(color.red, 20), "Bearish FVG Border")
+mitigatedAlpha = 90
+
+// FVG Variant Colors
+perfectFVGColor = input.color(color.new(color.lime, 60), "Perfect FVG")
+breakawayFVGColor = input.color(color.new(color.blue, 60), "Breakaway FVG")
+rejectionFVGColor = input.color(color.new(color.orange, 60), "Rejection FVG")
+
+// Order Block Colors
+bulOBColor = input.color(color.new(color.purple, 70), "Bullish Order Block")
+bearOBColor = input.color(color.new(color.fuchsia, 70), "Bearish Order Block")
+
+// =================== Structure to store FVG information ===================
+type FVG
+    int start_idx
+    int candle3_idx
+    float top
+    float bottom
+    string fvgType // "BISI" or "SIBI"
+    string fvgVariant // "Perfect", "Breakaway", "Rejection"
+    bool mitigated
+    string timeframe
+    float strength // 0-100 based on various factors
+    bool confirmedByLowerTF
+    bool confluenceWithOtherIndicator
+
+var FVG[] bullishFVGs = array.new<FVG>()
+var FVG[] bearishFVGs = array.new<FVG>()
+
+// Order Block structure
+type OrderBlock
+    int idx
+    float top
+    float bottom
+    string direction // "Bullish" or "Bearish"
+    bool active
+
+var OrderBlock[] orderBlocks = array.new<OrderBlock>()
+
+// =================== Utility Functions ===================
+// Function to calculate adaptive ATR-based gap threshold
+getAdaptiveGapThreshold() =>
+    atr = ta.atr(volPeriod)
+    baseThreshold = fvgMinGapSize / 100 // Convert percent to decimal
+    adaptiveThreshold = atr * volMultiplier / close * 100 // Convert to percentage
+    math.max(baseThreshold * 100, adaptiveThreshold) // Return the larger of the two as percentage
+
+// Function to get FVG strength based on various factors
+calculateFVGStrength(gapSize, variant, volume, mtfConfirmed) =>
+    // Base strength from gap size (40% weight)
+    baseStrength = math.min(100, gapSize / fvgMinGapSize * 40)
+    
+    // Variant bonus (30% weight)
+    variantBonus = 0.0
+    if variant == "Perfect"
+        variantBonus := 30.0
+    else if variant == "Breakaway"
+        variantBonus := 25.0
+    else if variant == "Rejection"
+        variantBonus := 15.0
+    
+    // Volume factor (20% weight)
+    volFactor = volume > ta.sma(volume, 20) ? 20.0 : 10.0
+    
+    // MTF confirmation (10% weight)
+    mtfBonus = mtfConfirmed ? 10.0 : 0.0
+    
+    // Sum all factors
+    baseStrength + variantBonus + volFactor + mtfBonus
+
+// Function to determine market structure more accurately
+analyzeMarketStructure(length) =>
+    var pivotHighs = array.new<float>(0)
+    var pivotHighIdxs = array.new<int>(0)
+    var pivotLows = array.new<float>(0)
+    var pivotLowIdxs = array.new<int>(0)
+    
+    // Detect pivot points using zigzag-like algorithm
+    ph = ta.pivothigh(high, length, length)
+    pl = ta.pivotlow(low, length, length)
+    
+    if not na(ph)
+        array.push(pivotHighs, ph)
+        array.push(pivotHighIdxs, bar_index - length)
+        
+    if not na(pl)
+        array.push(pivotLows, pl)
+        array.push(pivotLowIdxs, bar_index - length)
+    
+    // Clean up old pivot points
+    if array.size(pivotHighIdxs) > 10
+        array.shift(pivotHighs)
+        array.shift(pivotHighIdxs)
+    if array.size(pivotLowIdxs) > 10
+        array.shift(pivotLows)
+        array.shift(pivotLowIdxs)
+    
+    // Determine trend based on recent pivot points
+    trend = "neutral"
+    if array.size(pivotHighs) >= 2 and array.size(pivotLows) >= 2
+        h1 = array.get(pivotHighs, array.size(pivotHighs) - 1)
+        h2 = array.get(pivotHighs, array.size(pivotHighs) - 2)
+        l1 = array.get(pivotLows, array.size(pivotLows) - 1)
+        l2 = array.get(pivotLows, array.size(pivotLows) - 2)
+        
+        if h1 > h2 and l1 > l2
+            trend := "bullish"
+        else if h1 < h2 and l1 < l2
+            trend := "bearish"
+        else if h1 > h2 and l1 < l2
+            trend := "expanding"
+        else if h1 < h2 and l1 > l2
+            trend := "contracting"
+    
+    // Return structure with trend and pivot arrays
+    [trend, pivotHighs, pivotLows, pivotHighIdxs, pivotLowIdxs]
+
+// Function to detect FVGs in a given timeframe
+detectFVGs(h, l, c, o, v, tf) =>
+    var newBullishFVGs = array.new<FVG>()
+    var newBearishFVGs = array.new<FVG>()
+    
+    // Get adaptive gap threshold if enabled
+    thresholdPct = useAdaptiveGapSize ? getAdaptiveGapThreshold() : fvgMinGapSize
+    
+    // FVG detection logic with enhanced pattern recognition
+    for i = 2 to bar_index
+        // Check for Bullish FVG (BISI)
+        if detectBISI and l[i] > h[i-2]
+            // Calculate gap size in percentage
+            gapSize = (l[i] - h[i-2]) / h[i-2] * 100
+            
+            if gapSize >= thresholdPct
+                // Determine FVG variant with improved logic
+                variant = "Perfect" // Default
+                
+                // Enhanced breakaway detection (looks at volume and momentum)
+                if c[i] > h[i-1] and v[i] > v[i-1] * 1.2
+                    variant := "Breakaway"
+                // Enhanced rejection detection (considers price action patterns)
+                else if c[i] < l[i] + (h[i] - l[i]) * 0.3 and c[i-1] < o[i-1]
+                    variant := "Rejection"
+                
+                // Calculate strength based on multiple factors
+                strength = calculateFVGStrength(gapSize, variant, v[i], tf != timeframeInput)
+                
+                // Create enhanced FVG object
+                newFVG = FVG.new()
+                newFVG.start_idx := i-2
+                newFVG.candle3_idx := i
+                newFVG.top := l[i]
+                newFVG.bottom := h[i-2]
+                newFVG.fvgType := "BISI"
+                newFVG.fvgVariant := variant
+                newFVG.mitigated := false
+                newFVG.timeframe := tf
+                newFVG.strength := strength
+                newFVG.confirmedByLowerTF := false
+                newFVG.confluenceWithOtherIndicator := false
+                
+                array.push(newBullishFVGs, newFVG)
+        
+        // Check for Bearish FVG (SIBI)
+        if detectSIBI and h[i] < l[i-2]
+            // Calculate gap size in percentage
+            gapSize = (l[i-2] - h[i]) / l[i-2] * 100
+            
+            if gapSize >= thresholdPct
+                // Determine FVG variant with improved logic
+                variant = "Perfect" // Default
+                
+                // Enhanced breakaway detection
+                if c[i] < l[i-1] and v[i] > v[i-1] * 1.2
+                    variant := "Breakaway"
+                // Enhanced rejection detection
+                else if c[i] > h[i] - (h[i] - l[i]) * 0.3 and c[i-1] > o[i-1]
+                    variant := "Rejection"
+                
+                // Calculate strength based on multiple factors
+                strength = calculateFVGStrength(gapSize, variant, v[i], tf != timeframeInput)
+                
+                // Create enhanced FVG object
+                newFVG = FVG.new()
+                newFVG.start_idx := i-2
+                newFVG.candle3_idx := i
+                newFVG.top := l[i-2]
+                newFVG.bottom := h[i]
+                newFVG.fvgType := "SIBI"
+                newFVG.fvgVariant := variant
+                newFVG.mitigated := false
+                newFVG.timeframe := tf
+                newFVG.strength := strength
+                newFVG.confirmedByLowerTF := false
+                newFVG.confluenceWithOtherIndicator := false
+                
+                array.push(newBearishFVGs, newFVG)
+    
+    [newBullishFVGs, newBearishFVGs]
+
+// Function to detect order blocks
+detectOrderBlocks() =>
+    var newOrderBlocks = array.new<OrderBlock>()
+    
+    // Order block detection logic - bullish OB is a strong bearish candle followed by bullish momentum
+    for i = 0 to math.min(obLookback, bar_index)
+        // Bullish Order Block (a bearish candle that precedes bullish momentum)
+        if i >= 2 and close[i+2] < open[i+2] and close[i+1] > open[i+1] and close[i] > close[i+1]
+            bullOB = OrderBlock.new()
+            bullOB.idx := bar_index - (i+2)
+            bullOB.top := high[i+2]
+            bullOB.bottom := low[i+2]
+            bullOB.direction := "Bullish"
+            bullOB.active := true
+            array.push(newOrderBlocks, bullOB)
+            
+        // Bearish Order Block (a bullish candle that precedes bearish momentum)
+        if i >= 2 and close[i+2] > open[i+2] and close[i+1] < open[i+1] and close[i] < close[i+1]
+            bearOB = OrderBlock.new()
+            bearOB.idx := bar_index - (i+2)
+            bearOB.top := high[i+2]
+            bearOB.bottom := low[i+2]
+            bearOB.direction := "Bearish"
+            bearOB.active := true
+            array.push(newOrderBlocks, bearOB)
+    
+    newOrderBlocks
+
+// =================== Multi-Timeframe Analysis ===================
+// Get current timeframe data
+[bullish, bearish] = detectFVGs(high, low, close, open, volume, timeframeInput)
+
+// Get higher timeframe data
+[htfBullish, htfBearish] = request.security(syminfo.tickerid, higherTF, detectFVGs(high, low, close, open, volume, higherTF))
+
+// Get lower timeframe data for confirmation
+[ltfBullish, ltfBearish] = request.security(syminfo.tickerid, lowerTF, detectFVGs(high, low, close, open, volume, lowerTF))
+
+// =================== Process and Manage FVGs ===================
+// Check for FVG mitigation and cleanup old FVGs
+processAndCleanFVGs() =>
+    // Process bullish FVGs
+    for i = array.size(bullishFVGs) - 1 to 0 by -1
+        fvg = array.get(bullishFVGs, i)
+        
+        // Check if FVG is too old
+        if bar_index - fvg.start_idx > fvgMaxAge
+            array.remove(bullishFVGs, i)
+            continue
+        
+        // Enhanced mitigation check (considers wicks and closes)
+        if not fvg.mitigated
+            if low <= fvg.top and low >= fvg.bottom
+                fvg.mitigated := true
+                
+                // Generate alert for mitigation
+                if alertsOn
+                    alert("Bullish FVG Mitigated", alert.freq_once_per_bar)
+                
+                if not showMitigated
+                    array.remove(bullishFVGs, i)
+    
+    // Process bearish FVGs
+    for i = array.size(bearishFVGs) - 1 to 0 by -1
+        fvg = array.get(bearishFVGs, i)
+        
+        // Check if FVG is too old
+        if bar_index - fvg.start_idx > fvgMaxAge
+            array.remove(bearishFVGs, i)
+            continue
+        
+        // Enhanced mitigation check
+        if not fvg.mitigated
+            if high >= fvg.bottom and high <= fvg.top
+                fvg.mitigated := true
+                
+                // Generate alert for mitigation
+                if alertsOn
+                    alert("Bearish FVG Mitigated", alert.freq_once_per_bar)
+                
+                if not showMitigated
+                    array.remove(bearishFVGs, i)
+
+// Process and manage order blocks
+processOrderBlocks() =>
+    for i = array.size(orderBlocks) - 1 to 0 by -1
+        ob = array.get(orderBlocks, i)
+        
+        // Check if order block is too old
+        if bar_index - ob.idx > fvgMaxAge
+            array.remove(orderBlocks, i)
+            continue
+        
+        // Check if order block is hit (price trades into it)
+        if ob.direction == "Bullish" and low <= ob.top and low >= ob.bottom
+            ob.active := false
+            
+            // Generate alert for OB hit
+            if alertsOn
+                alert("Bullish Order Block Hit", alert.freq_once_per_bar)
+                
+            if not showMitigated
+                array.remove(orderBlocks, i)
+                
+        if ob.direction == "Bearish" and high >= ob.bottom and high <= ob.top
+            ob.active := false
+            
+            // Generate alert for OB hit
+            if alertsOn
+                alert("Bearish Order Block Hit", alert.freq_once_per_bar)
+                
+            if not showMitigated
+                array.remove(orderBlocks, i)
+
+// Add new FVGs to our collections with MTF confirmation check
+addNewFVGs() =>
+    // Process bullish FVGs
+    for i = 0 to array.size(bullish) - 1
+        newFVG = array.get(bullish, i)
+        
+        // Check for lower timeframe confirmation
+        if array.size(ltfBullish) > 0
+            for j = 0 to array.size(ltfBullish) - 1
+                ltfFVG = array.get(ltfBullish, j)
+                // If there's a lower TF FVG near this one, mark as confirmed
+                if math.abs(newFVG.top - ltfFVG.top) / newFVG.top * 100 < 0.5
+                    newFVG.confirmedByLowerTF := true
+                    newFVG.strength := newFVG.strength + 10
+                    break
+        
+        array.push(bullishFVGs, newFVG)
+    
+    // Process bearish FVGs
+    for i = 0 to array.size(bearish) - 1
+        newFVG = array.get(bearish, i)
+        
+        // Check for lower timeframe confirmation
+        if array.size(ltfBearish) > 0
+            for j = 0 to array.size(ltfBearish) - 1
+                ltfFVG = array.get(ltfBearish, j)
+                // If there's a lower TF FVG near this one, mark as confirmed
+                if math.abs(newFVG.bottom - ltfFVG.bottom) / newFVG.bottom * 100 < 0.5
+                    newFVG.confirmedByLowerTF := true
+                    newFVG.strength := newFVG.strength + 10
+                    break
+        
+        array.push(bearishFVGs, newFVG)
+    
+    // Add higher timeframe FVGs
+    for i = 0 to array.size(htfBullish) - 1
+        array.push(bullishFVGs, array.get(htfBullish, i))
+    
+    for i = 0 to array.size(htfBearish) - 1
+        array.push(bearishFVGs, array.get(htfBearish, i))
+    
+    // Add new order blocks
+    if showOrderBlocks
+        newOBs = detectOrderBlocks()
+        for i = 0 to array.size(newOBs) - 1
+            array.push(orderBlocks, array.get(newOBs, i))
+
+// =================== Draw FVG zones on chart ===================
+drawFVGs() =>
+    // Draw bullish FVGs
+    for i = 0 to array.size(bullishFVGs) - 1
+        fvg = array.get(bullishFVGs, i)
+        
+        // Determine box color based on FVG variant and mitigation status
+        fvgColor = bullishFVGColor
+        borderColor = bullishFVGBorderColor
+        
+        if fvg.fvgVariant == "Perfect"
+            fvgColor := color.new(perfectFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        else if fvg.fvgVariant == "Breakaway"
+            fvgColor := color.new(breakawayFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        else if fvg.fvgVariant == "Rejection"
+            fvgColor := color.new(rejectionFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        
+        if fvg.mitigated
+            borderColor := color.new(borderColor, mitigatedAlpha)
+        
+        // Draw FVG box with dynamic transparency based on strength
+        transparencyFactor = math.round(100 - fvg.strength / 2)
+        box.new(
+            fvg.start_idx, 
+            fvg.top, 
+            extendFVG ? bar_index : fvg.candle3_idx, 
+            fvg.bottom, 
+            bgcolor=color.new(fvgColor, transparencyFactor), 
+            border_color=borderColor, 
+            border_width=1
+        )
+        
+        // Add enhanced label for all FVGs
+        labelStyle = fvg.fvgType == "BISI" ? label.style_label_down : label.style_label_up
+        labelText = fvg.timeframe + "\n" + fvg.fvgVariant
+        if fvg.confirmedByLowerTF
+            labelText := labelText + "\n✓"
+        
+        sizeEnum = 
+             labelSize == "tiny" ? size.tiny :
+             labelSize == "small" ? size.small :
+             labelSize == "normal" ? size.normal :
+             size.large
+             
+        label.new(
+            fvg.start_idx, 
+            fvg.fvgType == "BISI" ? fvg.top : fvg.bottom, 
+            labelText, 
+            labelStyle, 
+            color.new(perfectFVGColor, 80), 
+            color.white, 
+            sizeEnum
+        )
+    
+    // Draw bearish FVGs
+    for i = 0 to array.size(bearishFVGs) - 1
+        fvg = array.get(bearishFVGs, i)
+        
+        // Determine box color based on FVG variant and mitigation status
+        fvgColor = bearishFVGColor
+        borderColor = bearishFVGBorderColor
+        
+        if fvg.fvgVariant == "Perfect"
+            fvgColor := color.new(perfectFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        else if fvg.fvgVariant == "Breakaway"
+            fvgColor := color.new(breakawayFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        else if fvg.fvgVariant == "Rejection"
+            fvgColor := color.new(rejectionFVGColor, fvg.mitigated ? mitigatedAlpha : 60)
+        
+        if fvg.mitigated
+            borderColor := color.new(borderColor, mitigatedAlpha)
+        
+        // Draw FVG box with dynamic transparency based on strength
+        transparencyFactor = math.round(100 - fvg.strength / 2)
+        box.new(
+            fvg.start_idx, 
+            fvg.top, 
+            extendFVG ? bar_index : fvg.candle3_idx, 
+            fvg.bottom, 
+            bgcolor=color.new(fvgColor, transparencyFactor), 
+            border_color=borderColor, 
+            border_width=1
+        )
+        
+        // Add enhanced label for all FVGs
+        labelStyle = fvg.fvgType == "SIBI" ? label.style_label_up : label.style_label_down
+        labelText = fvg.timeframe + "\n" + fvg.fvgVariant
+        if fvg.confirmedByLowerTF
+            labelText := labelText + "\n✓"
+            
+        sizeEnum = 
+             labelSize == "tiny" ? size.tiny :
+             labelSize == "small" ? size.small :
+             labelSize == "normal" ? size.normal :
+             size.large
+             
+        label.new(
+            fvg.start_idx, 
+            fvg.fvgType == "SIBI" ? fvg.bottom : fvg.top, 
+            labelText, 
+            labelStyle, 
+            color.new(perfectFVGColor, 80), 
+            color.white, 
+            sizeEnum
+        )
+
+// Draw Order Blocks
+drawOrderBlocks() =>
+    if showOrderBlocks
+        for i = 0 to array.size(orderBlocks) - 1
+            ob = array.get(orderBlocks, i)
+            
+            // Determine box color
+            obColor = ob.direction == "Bullish" ? bulOBColor : bearOBColor
+            if not ob.active
+                obColor := color.new(obColor, 90)
+            
+            // Draw order block box
+            box.new(
+                ob.idx, 
+                ob.top, 
+                bar_index, 
+                ob.bottom, 
+                bgcolor=obColor, 
+                border_color=color.new(color.white, 70),
+                border_width=1
+            )
+            
+            // Add label
+            labelStyle = ob.direction == "Bullish" ? label.style_label_up : label.style_label_down
+            labelPos = ob.direction == "Bullish" ? ob.bottom : ob.top
+            
+            sizeEnum = 
+                 labelSize == "tiny" ? size.tiny :
+                 labelSize == "small" ? size.small :
+                 labelSize == "normal" ? size.normal :
+                 size.large
+                 
+            label.new(
+                ob.idx, 
+                labelPos, 
+                ob.direction + " OB", 
+                labelStyle, 
+                color.new(color.gray, 80), 
+                color.white, 
+                sizeEnum
+            )
+
+// =================== Entry Signal Generation ===================
+// Enhanced entry signal generator with machine learning-inspired pattern recognition
+generateEntrySignals() =>
+    var bullishEntries = array.new<int>(0)
+    var bearishEntries = array.new<int>(0)
+    
+    if not showEntrySignals
+        return [bullishEntries, bearishEntries]
+    
+    // Get current market structure
+    [structureTrend, pivotHighs, pivotLows, pivotHighIdxs, pivotLowIdxs] = analyzeMarketStructure(10)
+    
+    // Get ATR for volatility assessment
+    currentATR = ta.atr(atrPeriod)
+    
+    // ------------------- Advanced Entry Logic -------------------
+    if entryStrategy == "Advanced"
+        // Bullish Entries - Complex pattern recognition
+        bullishSetupCount = 0
+        
+        // 1. Check for active bullish FVGs nearby
+        for i = 0 to array.size(bullishFVGs) - 1
+            fvg = array.get(bullishFVGs, i)
+            if not fvg.mitigated and fvg.strength > 60
+                // Price approaching FVG from below
+                if high > fvg.bottom - currentATR and high < fvg.bottom
+                    bullishSetupCount += 1
+                    break
+        
+        // 2. Check if price is near a bullish order block
+        for i = 0 to array.size(orderBlocks) - 1
+            ob = array.get(orderBlocks, i)
+            if ob.direction == "Bullish" and ob.active
+                if low <= ob.top and low >= ob.bottom
+                    bullishSetupCount += 1
+                    break
+        
+        // 3. Check for bullish market structure
+        if structureTrend == "bullish" or structureTrend == "expanding"
+            bullishSetupCount += 1
+        
+        // 4. Check for RSI oversold on lower timeframe
+        ltfRSI = request.security(syminfo.tickerid, lowerTF, ta.rsi(close, 14))
+        if ltfRSI < 30
+            bullishSetupCount += 1
+        
+        // 5. Check for bullish engulfing pattern
+        if low < low[1] and close > open[1] and close > close[1] and open < open[1]
+            bullishSetupCount += 1
+        
+        // Generate entry signal if enough setup conditions are met
+        if bullishSetupCount >= confluenceRequired
+            array.push(bullishEntries, bar_index)
+            if alertsOn
+                alert("Bullish Entry Signal", alert.freq_once_per_bar)
+        
+        // Bearish Entries - Complex pattern recognition
+        bearishSetupCount = 0
+        
+        // 1. Check for active bearish FVGs nearby
+        for i = 0 to array.size(bearishFVGs) - 1
+            fvg = array.get(bearishFVGs, i)
+            if not fvg.mitigated and fvg.strength > 60
+                // Price approaching FVG from above
+                if low < fvg.top + currentATR and low > fvg.top
+                    bearishSetupCount += 1
+                    break
+        
+        // 2. Check if price is near a bearish order block
+        for i = 0 to array.size(orderBlocks) - 1
+            ob = array.get(orderBlocks, i)
+            if ob.direction == "Bearish" and ob.active
+                if high >= ob.bottom and high <= ob.top
+                    bearishSetupCount += 1
+                    break
+        
+        // 3. Check for bearish market structure
+        if structureTrend == "bearish" or structureTrend == "expanding"
+            bearishSetupCount += 1
+        
+        // 4. Check for RSI overbought on lower timeframe
+        if ltfRSI > 70
+            bearishSetupCount += 1
+        
+        // 5. Check for bearish engulfing pattern
+        if high > high[1] and close < open[1] and close < close[1] and open > open[1]
+            bearishSetupCount += 1
+        
+        // Generate entry signal if enough setup conditions are met
+        if bearishSetupCount >= confluenceRequired
+            array.push(bearishEntries, bar_index)
+            if alertsOn
+                alert("Bearish Entry Signal", alert.freq_once_per_bar)
+    
+    // Simpler entry strategies
+    else
+        // For Confluence or Simple strategies
+        // Find high-quality FVGs for potential entries
+        for i = 0 to array.size(bullishFVGs) - 1
+            fvg = array.get(bullishFVGs, i)
+            
+            if not fvg.mitigated
+                if entryStrategy == "Simple"
+                    // Simple strategy: enter when price approaches a Perfect FVG
+                    if fvg.fvgVariant == "Perfect" and high > fvg.bottom - currentATR/2 and high < fvg.bottom
+                        array.push(bullishEntries, bar_index)
+                        break
+                else // "Confluence"
+                    // Confluence strategy: need additional confirmations
+                    if fvg.fvgVariant == "Perfect" and fvg.confirmedByLowerTF and structureTrend == "bullish"
+                        array.push(bullishEntries, bar_index)
+                        break
+        
+        for i = 0 to array.size(bearishFVGs) - 1
+            fvg = array.get(bearishFVGs, i)
+            
+            if not fvg.mitigated
+                if entryStrategy == "Simple"
+                    // Simple strategy: enter when price approaches a Perfect FVG
+                    if fvg.fvgVariant == "Perfect" and low < fvg.top + currentATR/2 and low > fvg.top
+                        array.push(bearishEntries, bar_index)
+                        break
+                else // "Confluence"
+                    // Confluence strategy: need additional confirmations
+                    if fvg.fvgVariant == "Perfect" and fvg.confirmedByLowerTF and structureTrend == "bearish"
+                        array.push(bearishEntries, bar_index)
+                        break
+    
+    [bullishEntries, bearishEntries, structureTrend]
+
+// Draw entry signals and risk management levels
+drawEntrySignals(bullishEntries, bearishEntries, trend) =>
+    // Entry signals
+    for i = 0 to array.size(bullishEntries) - 1
+        entryBar = array.get(bullishEntries, i)
+        if entryBar == bar_index
+            label.new(bar_index, low - syminfo.mintick * 20, "BUY", label.style_label_up, color.green, color.white, size.normal)
+            
+            // Draw risk management levels if enabled
+            if riskManagement
+                stopSize = currentATR * atrMultiplier
+                entryPrice = close
+                stopPrice = entryPrice - stopSize
+                targetPrice = entryPrice + (stopSize * riskRewardRatio)
+                
+                // Stop Loss Line
+                line.new(bar_index, stopPrice, bar_index + 20, stopPrice, color=color.red, width=2, style=line.style_dashed)
+                label.new(bar_index + 20, stopPrice, "SL: " + str.tostring(stopPrice, "#.##"), label.style_label_left, color.red, color.white, size.small)
+                
+                // Take Profit Line
+                line.new(bar_index, targetPrice, bar_index + 20, targetPrice, color=color.green, width=2, style=line.style_dashed)
+                label.new(bar_index + 20, targetPrice, "TP: " + str.tostring(targetPrice, "#.##"), label.style_label_left, color.green, color.white, size.small)
+    
+    for i = 0 to array.size(bearishEntries) - 1
+        entryBar = array.get(bearishEntries, i)
+        if entryBar == bar_index
+            label.new(bar_index, high + syminfo.mintick * 20, "SELL", label.style_label_down, color.red, color.white, size.normal)
+            
+            // Draw risk management levels if enabled
+            if riskManagement
+                stopSize = currentATR * atrMultiplier
+                entryPrice = close
+                stopPrice = entryPrice + stopSize
+                targetPrice = entryPrice - (stopSize * riskRewardRatio)
+                
+                // Stop Loss Line
+                line.new(bar_index, stopPrice, bar_index + 20, stopPrice, color=color.red, width=2, style=line.style_dashed)
+                label.new(bar_index + 20, stopPrice, "SL: " + str.tostring(stopPrice, "#.##"), label.style_label_left, color.red, color.white, size.small)
+                
+                // Take Profit Line
+                line.new(bar_index, targetPrice, bar_index + 20, targetPrice, color=color.green, width=2, style=line.style_dashed)
+                label.new(bar_index + 20, targetPrice, "TP: " + str.tostring(targetPrice, "#.##"), label.style_label_left, color.green, color.white, size.small)
+
+// =================== Execution ===================
+// Calculate adaptive ATR once for all functions
+var float currentATR = ta.atr(atrPeriod)
+
+// Add new detected FVGs to our collections
+addNewFVGs()
+
+// Process existing FVGs (check mitigation, cleanup)
+processAndCleanFVGs()
+
+// Process order blocks
+if showOrderBlocks
+    processOrderBlocks()
+
+// Draw visual elements
+drawFVGs()
+if showOrderBlocks
+    drawOrderBlocks()
+
+// Generate and draw entry signals
+[bullEntries, bearEntries, structure] = generateEntrySignals()
+drawEntrySignals(bullEntries, bearEntries, structure)
+
+// =================== Information Display ===================
+// Display information in status line
+var statusText = ""
+if array.size(bullishFVGs) > 0 or array.size(bearishFVGs) > 0
+    // Count active FVGs
+    bisiCount = 0
+    sibiCount = 0
+    
+    for i = 0 to array.size(bullishFVGs) - 1
+        if not array.get(bullishFVGs, i).mitigated
+            bisiCount += 1
+    
+    for i = 0 to array.size(bearishFVGs) - 1
+        if not array.get(bearishFVGs, i).mitigated
+            sibiCount += 1
+    
+    // Count active order blocks
+    bullOBCount = 0
+    bearOBCount = 0
+    
+    if showOrderBlocks
+        for i = 0 to array.size(orderBlocks) - 1
+            ob = array.get(orderBlocks, i)
+            if ob.active
+                if ob.direction == "Bullish"
+                    bullOBCount += 1
+                else
+                    bearOBCount += 1
+    
+    // Create advanced status text
+    statusText := "Unmitigated FVGs - BISI: " + str.tostring(bisiCount) + " | SIBI: " + str.tostring(sibiCount)
+    
+    if showOrderBlocks
+        statusText := statusText + " | OBs - Bull: " + str.tostring(bullOBCount) + " | Bear: " + str.tostring(bearOBCount)
+    
+    statusText := statusText + " | Structure: " + structure
+    
+    // Add entry signals
+    if array.size(bullEntries) > 0 and array.get(bullEntries, array.size(bullEntries) - 1) == bar_index
+        statusText := statusText + " | 🟢 BULLISH ENTRY"
+    if array.size(bearEntries) > 0 and array.get(bearEntries, array.size(bearEntries) - 1) == bar_index
+        statusText := statusText + " | 🔴 BEARISH ENTRY"
+
+// Create status display box
+table.new(position.top_right, 1, 1, bgcolor=color.new(color.black, 70), border_width=1)
+table.cell(table.new(position.top_right, 1, 1), 0, 0, statusText, text_color=color.white, bgcolor=color.new(color.blue, 70))
+
+// Plot performance metrics (optional but useful for backtesting)
+plot(currentATR, "ATR", color.purple, 2, plot.style_cross, display = display.none)
