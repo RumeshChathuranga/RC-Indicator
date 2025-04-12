@@ -1,0 +1,520 @@
+// Advanced Fair Value Gap (FVG) Indicator
+// Designed for Gold Scalping on 15m and 5m timeframes
+// Based on comprehensive FVG theory and market structure concepts
+
+//@version=6
+indicator("RC-Advanced FVG Indicator", overlay=true, max_labels_count=500, max_boxes_count=500, dynamic_requests=true)
+
+// User Inputs
+timeframeInput = input.string("15", "Chart Timeframe", options=["1", "5", "15", "60", "240", "D"]) // Using current chart timeframe is often better: timeframe.period
+detectBISI = input.bool(true, "Detect Bullish FVGs (BISI)")
+detectSIBI = input.bool(true, "Detect Bearish FVGs (SIBI)")
+
+// XAUUSD-specific settings
+isGold = syminfo.ticker == "XAUUSD" or syminfo.ticker == "GOLD" or syminfo.ticker == "GC"
+// For gold, default to a much smaller gap size in absolute points rather than percentage
+goldGapSize = input.float(1.0, "Gold Minimum Gap (points)", minval=0.1, step=0.1, tooltip="Absolute minimum gap size in points specifically for gold")
+// For other instruments, use percentage
+fvgMinGapSize = input.float(0.05, "Other Instruments Gap Size (%)", minval=0.01, step=0.01)
+
+fvgMaxAge = input.int(150, "Maximum FVG Age (bars)", minval=1)
+showMitigated = input.bool(true, "Show Mitigated FVGs")
+extendFVG = input.bool(true, "Extend FVG Zones")
+mtfAnalysis = input.bool(true, "Multi-Timeframe Analysis")
+higherTF = input.string("60", "Higher Timeframe", options=["60", "240", "D", "W"])
+showEntrySignals = input.bool(true, "Show Entry Signals")
+entryStrategy = input.string("Sharp Turn", "Entry Strategy", options=["Sharp Turn", "Sharp Turn + Confirmation"])
+
+// Risk Management Settings (Now functional)
+riskManagement = input.bool(true, "Show Risk Management Levels")
+riskReward = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.5, tooltip="Target will be set at this multiple of the risk")
+slPaddingPoints = input.float(2.0, "Stop Loss Padding (points)", minval=0.1, step=0.1, tooltip="Additional padding for Stop Loss in points")
+
+// Color Settings Section
+colorSection = "Colors"
+// FVG Colors
+bullishFVGColorInput = input.color(color.green, "Bullish FVG Color", inline="bullish_colors", group=colorSection)
+bullishFVGTransp = input.int(80, "Transparency", minval=0, maxval=100, inline="bullish_colors", group=colorSection)
+bearishFVGColorInput = input.color(color.red, "Bearish FVG Color", inline="bearish_colors", group=colorSection)
+bearishFVGTransp = input.int(80, "Transparency", minval=0, maxval=100, inline="bearish_colors", group=colorSection)
+
+// Border Colors
+bullishBorderColorInput = input.color(color.green, "Bullish Border Color", inline="bullish_border", group=colorSection)
+bullishBorderTransp = input.int(20, "Transparency", minval=0, maxval=100, inline="bullish_border", group=colorSection)
+bearishBorderColorInput = input.color(color.red, "Bearish Border Color", inline="bearish_border", group=colorSection)
+bearishBorderTransp = input.int(20, "Transparency", minval=0, maxval=100, inline="bearish_border", group=colorSection)
+
+// FVG Variant Colors
+perfectFVGColorInput = input.color(color.lime, "Perfect FVG Color", inline="perfect_color", group=colorSection)
+perfectFVGTransp = input.int(70, "Transparency", minval=0, maxval=100, inline="perfect_color", group=colorSection)
+breakawayFVGColorInput = input.color(color.blue, "Breakaway FVG Color", inline="breakaway_color", group=colorSection)
+breakawayFVGTransp = input.int(70, "Transparency", minval=0, maxval=100, inline="breakaway_color", group=colorSection)
+rejectionFVGColorInput = input.color(color.orange, "Rejection FVG Color", inline="rejection_color", group=colorSection)
+rejectionFVGTransp = input.int(70, "Transparency", minval=0, maxval=100, inline="rejection_color", group=colorSection)
+
+// Mitigated FVG transparency
+mitigatedAlphaInput = input.int(90, "Mitigated FVG Transparency", minval=0, maxval=100, group=colorSection)
+
+// Risk Management Colors
+slColorInput = input.color(color.red, "Stop Loss Color", inline="sl_color", group=colorSection)
+slTransp = input.int(50, "Transparency", minval=0, maxval=100, inline="sl_color", group=colorSection)
+tpColorInput = input.color(color.green, "Take Profit Color", inline="tp_color", group=colorSection)
+tpTransp = input.int(50, "Transparency", minval=0, maxval=100, inline="tp_color", group=colorSection)
+
+// Signal Colors
+buySignalColorInput = input.color(color.green, "Buy Signal Color", inline="buy_color", group=colorSection)
+buySignalTransp = input.int(20, "Transparency", minval=0, maxval=100, inline="buy_color", group=colorSection)
+sellSignalColorInput = input.color(color.red, "Sell Signal Color", inline="sell_color", group=colorSection)
+sellSignalTransp = input.int(20, "Transparency", minval=0, maxval=100, inline="sell_color", group=colorSection)
+
+// Apply transparency to colors
+bullishFVGColor = color.new(bullishFVGColorInput, bullishFVGTransp)
+bearishFVGColor = color.new(bearishFVGColorInput, bearishFVGTransp)
+bullishFVGBorderColor = color.new(bullishBorderColorInput, bullishBorderTransp)
+bearishFVGBorderColor = color.new(bearishBorderColorInput, bearishBorderTransp)
+mitigatedAlpha = mitigatedAlphaInput
+perfectFVGColor = color.new(perfectFVGColorInput, perfectFVGTransp)
+breakawayFVGColor = color.new(breakawayFVGColorInput, breakawayFVGTransp)
+rejectionFVGColor = color.new(rejectionFVGColorInput, rejectionFVGTransp)
+buySignalColor = color.new(buySignalColorInput, buySignalTransp)
+sellSignalColor = color.new(sellSignalColorInput, sellSignalTransp)
+slColor = color.new(slColorInput, slTransp)
+tpColor = color.new(tpColorInput, tpTransp)
+
+// Color scheme - Using user-defined colors
+// (Moved to the user inputs section)
+
+// Structure to store risk management levels
+type RiskLevels
+    int entryBarIdx
+    float entryPrice
+    float slPrice
+    float tpPrice
+    string signalType // "BUY" or "SELL"
+    int lastBarDrawn
+
+// Initialize risk levels array
+var RiskLevels[] riskLevels = array.new<RiskLevels>()
+type FVG
+    int start_idx       // Bar index where the FVG starts (candle 1)
+    int candle3_idx     // Bar index where the FVG ends (candle 3)
+    float top
+    float bottom
+    string fvgType      // "BISI" or "SIBI"
+    string fvgVariant   // "Perfect", "Breakaway", "Rejection"
+    bool mitigated
+    string timeframe    // Timeframe this FVG belongs to
+    int creation_bar_idx // Bar index when this FVG object was created/detected
+
+// Use 'varip' for arrays to ensure they initialize only once and persist correctly
+varip FVG[] bullishFVGs = array.new<FVG>()
+varip FVG[] bearishFVGs = array.new<FVG>()
+
+// Function to detect FVGs in a given timeframe's data
+detectFVGs(h, l, c, o, tf, barIdx) =>
+    newBullishFVGs = array.new<FVG>()
+    newBearishFVGs = array.new<FVG>()
+
+    if nz(barIdx) >= 2
+        // Check for Bullish FVG (BISI) - When low[0] > high[2]
+        if detectBISI
+            // Different logic for gold vs other instruments
+            if isGold
+                // For gold, we use absolute price difference in points
+                gapInPoints = nz(l[0]) - nz(h[2])
+                
+                // Only create an FVG if the gap is large enough
+                if gapInPoints >= goldGapSize
+                    variant = "Perfect"
+                    if nz(c[0]) > nz(h[1])
+                        variant := "Breakaway"
+                    else if (nz(h[0]) - nz(l[0])) > 0 and nz(c[0]) < nz(l[0]) + (nz(h[0]) - nz(l[0])) * 0.3
+                        variant := "Rejection"
+                    newFVG = FVG.new(start_idx=barIdx - 2, candle3_idx=barIdx, top=nz(l[0]), bottom=nz(h[2]), fvgType="BISI", fvgVariant=variant, mitigated=false, timeframe=tf, creation_bar_idx=barIdx)
+                    array.push(newBullishFVGs, newFVG)
+            else
+                // For other instruments, we use percentage
+                if nz(l[0]) > nz(h[2])
+                    gapSize = (nz(l[0]) - nz(h[2])) / nz(h[2]) * 100
+                    if gapSize >= fvgMinGapSize
+                        variant = "Perfect"
+                        if nz(c[0]) > nz(h[1])
+                            variant := "Breakaway"
+                        else if (nz(h[0]) - nz(l[0])) > 0 and nz(c[0]) < nz(l[0]) + (nz(h[0]) - nz(l[0])) * 0.3
+                            variant := "Rejection"
+                        newFVG = FVG.new(start_idx=barIdx - 2, candle3_idx=barIdx, top=nz(l[0]), bottom=nz(h[2]), fvgType="BISI", fvgVariant=variant, mitigated=false, timeframe=tf, creation_bar_idx=barIdx)
+                        array.push(newBullishFVGs, newFVG)
+
+        // Check for Bearish FVG (SIBI) - When high[0] < low[2]
+        if detectSIBI
+            // Different logic for gold vs other instruments
+            if isGold
+                // For gold, we use absolute price difference in points
+                gapInPoints = nz(l[2]) - nz(h[0])
+                
+                // Only create an FVG if the gap is large enough
+                if gapInPoints >= goldGapSize
+                    variant = "Perfect"
+                    if nz(c[0]) < nz(l[1])
+                        variant := "Breakaway"
+                    else if (nz(h[0]) - nz(l[0])) > 0 and nz(c[0]) > nz(h[0]) - (nz(h[0]) - nz(l[0])) * 0.3
+                        variant := "Rejection"
+                    newFVG = FVG.new(start_idx=barIdx - 2, candle3_idx=barIdx, top=nz(l[2]), bottom=nz(h[0]), fvgType="SIBI", fvgVariant=variant, mitigated=false, timeframe=tf, creation_bar_idx=barIdx)
+                    array.push(newBearishFVGs, newFVG)
+            else
+                // For other instruments, we use percentage
+                if nz(h[0]) < nz(l[2])
+                    gapSize = (nz(l[2]) - nz(h[0])) / nz(l[2]) * 100
+                    if gapSize >= fvgMinGapSize
+                        variant = "Perfect"
+                        if nz(c[0]) < nz(l[1])
+                            variant := "Breakaway"
+                        else if (nz(h[0]) - nz(l[0])) > 0 and nz(c[0]) > nz(h[0]) - (nz(h[0]) - nz(l[0])) * 0.3
+                            variant := "Rejection"
+                        newFVG = FVG.new(start_idx=barIdx - 2, candle3_idx=barIdx, top=nz(l[2]), bottom=nz(h[0]), fvgType="SIBI", fvgVariant=variant, mitigated=false, timeframe=tf, creation_bar_idx=barIdx)
+                        array.push(newBearishFVGs, newFVG)
+    [newBullishFVGs, newBearishFVGs]
+
+// --- Main Logic ---
+
+// 1. Detect FVGs on the Current Timeframe
+[currentBullish, currentBearish] = detectFVGs(high, low, close, open, timeframe.period, bar_index)
+
+// 2. Add newly detected Current TF FVGs to the main arrays
+for fvg in currentBullish
+    array.push(bullishFVGs, fvg)
+for fvg in currentBearish
+    array.push(bearishFVGs, fvg)
+
+// 3. Detect FVGs on the Higher Timeframe (if enabled)
+htfBullish_T = array.new<FVG>()
+htfBearish_T = array.new<FVG>()
+if mtfAnalysis
+    [htf_h, htf_l, htf_c, htf_o, htf_barIdx] = request.security(syminfo.tickerid, higherTF, [high, low, close, open, bar_index], lookahead=barmerge.lookahead_off)
+    if barstate.isfirst or nz(htf_barIdx[1]) != nz(htf_barIdx)
+        [htfBullishDetected, htfBearishDetected] = detectFVGs(htf_h, htf_l, htf_c, htf_o, higherTF, bar_index)
+        htfBullish_T := htfBullishDetected
+        htfBearish_T := htfBearishDetected
+
+// 4. Add newly detected HTF FVGs to the main arrays
+for fvg in htfBullish_T
+    array.push(bullishFVGs, fvg)
+for fvg in htfBearish_T
+    array.push(bearishFVGs, fvg)
+
+// 5. Process Mitigation and Cleanup Old FVGs
+processAndCleanFVGs(fvgArray, currentLow, currentHigh) =>
+    // We need to iterate in reverse order (from last to first) when removing array elements
+    // But we can't use a different approach since we can't use negative step
+    size = array.size(fvgArray)
+    for idx = 0 to size - 1
+        // Calculate the real index from the end of the array
+        i = size - 1 - idx
+        // Break if we've gone too far (could happen if array size decreased during the loop)
+        if i < 0
+            break
+        fvg = array.get(fvgArray, i)
+        if bar_index - fvg.creation_bar_idx > fvgMaxAge
+            array.remove(fvgArray, i)
+            continue
+        if not fvg.mitigated
+            // Initialize the variable before conditionals
+            isMitigated = false
+            
+            // Gold uses stricter mitigation rules
+            if isGold
+                // For bullish FVGs (BISI), require price to go below the midpoint of the gap
+                // For bearish FVGs (SIBI), require price to go above the midpoint of the gap
+                midpoint = fvg.bottom + (fvg.top - fvg.bottom) * 0.5
+                
+                if fvg.fvgType == "BISI"
+                    // Only mitigate if price moves 70% into the gap
+                    penetrationPoint = fvg.bottom + (fvg.top - fvg.bottom) * 0.3
+                    isMitigated := currentLow <= penetrationPoint
+                else if fvg.fvgType == "SIBI"
+                    // Only mitigate if price moves 70% into the gap
+                    penetrationPoint = fvg.bottom + (fvg.top - fvg.bottom) * 0.7
+                    isMitigated := currentHigh >= penetrationPoint
+            else
+                // For other instruments, use the standard mitigation check
+                if fvg.fvgType == "BISI"
+                    isMitigated := currentLow <= fvg.top
+                else if fvg.fvgType == "SIBI"
+                    isMitigated := currentHigh >= fvg.bottom
+            
+            if isMitigated
+                fvg.mitigated := true
+                if not showMitigated
+                    array.remove(fvgArray, i)
+                    continue
+
+processAndCleanFVGs(bullishFVGs, low, high)
+processAndCleanFVGs(bearishFVGs, low, high)
+
+// 6. Draw FVG zones on chart
+drawFVGs() =>
+    // Draw bullish FVGs
+    bullishSize = array.size(bullishFVGs)
+    if bullishSize > 0
+        for i = 0 to bullishSize - 1
+            fvg = array.get(bullishFVGs, i)
+
+            boxColor = bullishFVGColor
+            borderColor = bullishFVGBorderColor
+            currentAlpha = 60
+
+            if fvg.mitigated and showMitigated
+                currentAlpha := mitigatedAlpha
+                boxColor := bullishFVGColor // Keep base color but change alpha
+            else if not fvg.mitigated
+                // ---> CORRECTED INDENTATION START <---
+                if fvg.fvgVariant == "Perfect"
+                    boxColor := perfectFVGColor
+                else if fvg.fvgVariant == "Breakaway"
+                    boxColor := breakawayFVGColor
+                else if fvg.fvgVariant == "Rejection"
+                    boxColor := rejectionFVGColor
+                // ---> CORRECTED INDENTATION END <---
+            else // Is mitigated but showMitigated is false
+                continue // Already removed in processing, but safe check
+
+            boxBgColor = color.new(boxColor, currentAlpha)
+            boxBorderColor = color.new(borderColor, fvg.mitigated and showMitigated ? mitigatedAlpha : 20)
+
+            right_bar = extendFVG ? bar_index : fvg.candle3_idx
+            if right_bar < fvg.candle3_idx
+                right_bar := fvg.candle3_idx
+
+            box.new(fvg.start_idx, fvg.top, right_bar, fvg.bottom, bgcolor=boxBgColor, border_color=boxBorderColor, border_width=1)
+
+            if fvg.timeframe != timeframe.period and not (fvg.mitigated and not showMitigated)
+                labelStyle = label.style_label_down
+                labelY = fvg.top
+                labelTextColor = color.white
+                labelColor = color.new(color.gray, 20)
+                if bar_index == fvg.candle3_idx + 1
+                    label.new(fvg.start_idx, labelY, fvg.timeframe + "\n" + fvg.fvgVariant, style=labelStyle, color=labelColor, textcolor=labelTextColor, size=size.tiny)
+
+    // Draw bearish FVGs
+    bearishSize = array.size(bearishFVGs)
+    if bearishSize > 0
+        for i = 0 to bearishSize - 1
+            fvg = array.get(bearishFVGs, i)
+
+            boxColor = bearishFVGColor
+            borderColor = bearishFVGBorderColor
+            currentAlpha = 60
+
+            if fvg.mitigated and showMitigated
+                currentAlpha := mitigatedAlpha
+                boxColor := bearishFVGColor // Keep base color but change alpha
+            else if not fvg.mitigated
+                // ---> CORRECTED INDENTATION START <---
+                if fvg.fvgVariant == "Perfect"
+                    boxColor := perfectFVGColor
+                else if fvg.fvgVariant == "Breakaway"
+                    boxColor := breakawayFVGColor
+                else if fvg.fvgVariant == "Rejection"
+                    boxColor := rejectionFVGColor
+                // ---> CORRECTED INDENTATION END <---
+            else // Is mitigated but showMitigated is false
+                continue
+
+            boxBgColor = color.new(boxColor, currentAlpha)
+            boxBorderColor = color.new(borderColor, fvg.mitigated and showMitigated ? mitigatedAlpha : 20)
+
+            right_bar = extendFVG ? bar_index : fvg.candle3_idx
+            if right_bar < fvg.candle3_idx
+                right_bar := fvg.candle3_idx
+
+            box.new(fvg.start_idx, fvg.top, right_bar, fvg.bottom, bgcolor=boxBgColor, border_color=boxBorderColor, border_width=1)
+
+            if fvg.timeframe != timeframe.period and not (fvg.mitigated and not showMitigated)
+                labelStyle = label.style_label_up
+                labelY = fvg.bottom
+                labelTextColor = color.white
+                labelColor = color.new(color.gray, 20)
+                if bar_index == fvg.candle3_idx + 1
+                    label.new(fvg.start_idx, labelY, fvg.timeframe + "\n" + fvg.fvgVariant, style=labelStyle, color=labelColor, textcolor=labelTextColor, size=size.tiny)
+
+drawFVGs()
+
+// 7. Generate entry signals
+generateEntrySignals() =>
+    bullishEntryBars = array.new_int()
+    bearishEntryBars = array.new_int()
+    if not showEntrySignals
+        [bullishEntryBars, bearishEntryBars]
+    else
+        // Find potential bullish entries
+        bullishSize = array.size(bullishFVGs)
+        if bullishSize > 0
+            for i = 0 to bullishSize - 1
+                fvg = array.get(bullishFVGs, i)
+                if fvg.mitigated
+                    continue
+                entrySignal = false
+                if entryStrategy == "Sharp Turn"
+                    if fvg.fvgVariant == "Perfect" and low <= fvg.top and low >= fvg.bottom * 0.95 and close > open
+                        entrySignal := true
+                    else if fvg.fvgVariant == "Breakaway" and bar_index == fvg.candle3_idx
+                        entrySignal := true
+                else if entryStrategy == "Sharp Turn + Confirmation"
+                    if fvg.fvgVariant == "Perfect" and low <= fvg.top and low >= fvg.bottom * 0.95 and close > open
+                        // *** Add Confirmation Logic Here ***
+                        entrySignal := true // Placeholder
+                    else if fvg.fvgVariant == "Breakaway" and bar_index == fvg.candle3_idx
+                        // *** Add Confirmation Logic Here ***
+                        entrySignal := true // Placeholder
+                if entrySignal
+                    array.push(bullishEntryBars, bar_index)
+                    break
+        // Find potential bearish entries
+        bearishSize = array.size(bearishFVGs)
+        if bearishSize > 0
+            for i = 0 to bearishSize - 1
+                fvg = array.get(bearishFVGs, i)
+                if fvg.mitigated
+                    continue
+                entrySignal = false
+                if entryStrategy == "Sharp Turn"
+                    if fvg.fvgVariant == "Perfect" and high >= fvg.bottom and high <= fvg.top * 1.05 and close < open
+                        entrySignal := true
+                    else if fvg.fvgVariant == "Breakaway" and bar_index == fvg.candle3_idx
+                        entrySignal := true
+                else if entryStrategy == "Sharp Turn + Confirmation"
+                    if fvg.fvgVariant == "Perfect" and high >= fvg.bottom and high <= fvg.top * 1.05 and close < open
+                        // *** Add Confirmation Logic Here ***
+                        entrySignal := true // Placeholder
+                    else if fvg.fvgVariant == "Breakaway" and bar_index == fvg.candle3_idx
+                        // *** Add Confirmation Logic Here ***
+                        entrySignal := true // Placeholder
+                if entrySignal
+                    array.push(bearishEntryBars, bar_index)
+                    break
+        [bullishEntryBars, bearishEntryBars]
+
+[bullEntries, bearEntries] = generateEntrySignals()
+
+// 8. Draw entry signals and calculate risk management levels
+drawEntrySignals(bullishIndices, bearishIndices) =>
+    newRiskLevels = array.new<RiskLevels>()
+    
+    // Handle bullish entries
+    if array.includes(bullishIndices, bar_index)
+        // Draw the buy signal label
+        label.new(bar_index, low - syminfo.mintick * 10, "BUY", style=label.style_label_up, color=buySignalColor, textcolor=color.white, size=size.normal)
+        
+        // Calculate risk management levels for bullish entries
+        if riskManagement
+            // Find the nearest active bullish FVG for entry
+            entryFVG = array.new<FVG>()
+            for i = 0 to array.size(bullishFVGs) - 1
+                fvg = array.get(bullishFVGs, i)
+                if not fvg.mitigated and fvg.fvgType == "BISI"
+                    array.push(entryFVG, fvg)
+            
+            if array.size(entryFVG) > 0
+                // Use the most recent FVG
+                recentFVG = array.get(entryFVG, array.size(entryFVG) - 1)
+                
+                // Calculate entry, stop loss, and take profit levels
+                entryPrice = close
+                slPrice = recentFVG.bottom - slPaddingPoints
+                slDistance = entryPrice - slPrice
+                tpPrice = entryPrice + (slDistance * riskReward)
+                
+                // Create risk level object and add to array (single-line style)
+                riskLevel = RiskLevels.new(entryBarIdx=bar_index, entryPrice=entryPrice, slPrice=slPrice, tpPrice=tpPrice, signalType="BUY", lastBarDrawn=bar_index)
+                array.push(newRiskLevels, riskLevel)
+    
+    // Handle bearish entries
+    if array.includes(bearishIndices, bar_index)
+        // Draw the sell signal label
+        label.new(bar_index, high + syminfo.mintick * 10, "SELL", style=label.style_label_down, color=sellSignalColor, textcolor=color.white, size=size.normal)
+                 
+        // Calculate risk management levels for bearish entries
+        if riskManagement
+            // Find the nearest active bearish FVG for entry
+            entryFVG = array.new<FVG>()
+            for i = 0 to array.size(bearishFVGs) - 1
+                fvg = array.get(bearishFVGs, i)
+                if not fvg.mitigated and fvg.fvgType == "SIBI"
+                    array.push(entryFVG, fvg)
+            
+            if array.size(entryFVG) > 0
+                // Use the most recent FVG
+                recentFVG = array.get(entryFVG, array.size(entryFVG) - 1)
+                
+                // Calculate entry, stop loss, and take profit levels
+                entryPrice = close
+                slPrice = recentFVG.top + slPaddingPoints
+                slDistance = slPrice - entryPrice
+                tpPrice = entryPrice - (slDistance * riskReward)
+                
+                // Create risk level object and add to array (single-line style)
+                riskLevel = RiskLevels.new(entryBarIdx=bar_index, entryPrice=entryPrice, slPrice=slPrice, tpPrice=tpPrice, signalType="SELL", lastBarDrawn=bar_index)
+                array.push(newRiskLevels, riskLevel)
+                
+    newRiskLevels
+
+drawEntrySignals(bullEntries, bearEntries)
+
+// 9. Market Structure (Basic Placeholder)
+var string structureTrend = "Neutral"
+var float lastPivotHigh = na
+var float lastPivotLow = na
+if barstate.isfirst
+    lastPivotHigh := high
+    lastPivotLow := low
+else
+    isHigherHigh = high > high[1]
+    isHigherLow = low > low[1]
+    isLowerHigh = high < high[1]
+    isLowerLow = low < low[1]
+    if isHigherHigh and isHigherLow
+        structureTrend := "Bullish↑"
+        lastPivotHigh := high
+        lastPivotLow := low
+    else if isLowerHigh and isLowerLow
+        structureTrend := "Bearish↓"
+        lastPivotHigh := high
+        lastPivotLow := low
+
+// --- Risk Management Placeholder ---
+// Add SL/TP drawing logic here if desired, triggered by bullEntries/bearEntries
+
+// 10. Display Information in Status Table
+var table statusTable = table.new(position.top_right, 5, 2, bgcolor = color.new(color.gray, 85), border_width = 1)
+if barstate.islast
+    bisiCount = 0
+    sibiCount = 0
+    for fvg in bullishFVGs
+        if not fvg.mitigated
+            bisiCount += 1
+    for fvg in bearishFVGs
+        if not fvg.mitigated
+            sibiCount += 1
+    
+    // Debugging information
+    bullishFVGsSize = array.size(bullishFVGs)
+    bearishFVGsSize = array.size(bearishFVGs)
+    totalSize = bullishFVGsSize + bearishFVGsSize
+    
+    statusText = "FVGs BISI: " + str.tostring(bisiCount) + " | SIBI: " + str.tostring(sibiCount)
+    structureText = "Market: " + structureTrend
+    debugText1 = isGold ? "Min Gap: " + str.tostring(goldGapSize, "#.##") + " pts" : 
+                 "Min Gap: " + str.tostring(fvgMinGapSize, "#.###") + "%"
+    debugText2 = "Total FVGs: " + str.tostring(totalSize) + " (" + str.tostring(bullishFVGsSize) + "|" + str.tostring(bearishFVGsSize) + ")"
+    
+    signalText = ""
+    if array.includes(bullEntries, bar_index)
+        signalText := " ▲ BUY SIGNAL ▲"
+    if array.includes(bearEntries, bar_index)
+        signalText := " ▼ SELL SIGNAL ▼"
+    
+    table.cell(statusTable, 0, 0, statusText, text_color = color.white, bgcolor=color.new(color.blue, 75))
+    table.cell(statusTable, 1, 0, structureText, text_color = color.white, bgcolor=color.new(color.orange, 75))
+    table.cell(statusTable, 2, 0, signalText, text_color = signalText == "" ? color.gray : color.black, bgcolor= signalText == "" ? color.gray : (str.contains(signalText, "BUY") ? color.green : color.red))
+    table.cell(statusTable, 0, 1, debugText1, text_color = color.white, bgcolor=color.new(color.purple, 75))
+    table.cell(statusTable, 1, 1, debugText2, text_color = color.white, bgcolor=color.new(color.purple, 75))
